@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PriAxom AIR</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Caveat&display=swap" rel="stylesheet">
+
+    <style>
+        body { display: flex; flex-direction: column; justify-content: space-between; align-items: stretch; background-color: #000000; height: 100vh; margin: 0; overflow: hidden; font-family: sans-serif; }
+        #header { padding: 20px; font-weight: bold; text-align: left; position: absolute; top: 0; left: 0; z-index: 10; pointer-events: none; }
+        #header-main-text { font-size: 1.5em; }
+        .header-part1 { background: linear-gradient(to right, #FF00FF, #FF69B4); -webkit-background-clip: text; -webkit-text-fill-color: transparent; } 
+        .header-part2 { background: linear-gradient(to right, #00FFFF, #1E90FF); -webkit-background-clip: text; -webkit-text-fill-color: transparent; } 
+        #header-copyright { background: linear-gradient(to right, #FF8C00, #FFD700); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-size: 0.8em; margin-top: 5px; width: max-content; }
+        .canvas-container { position: relative; width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; z-index: 5; }
+        video { display: none; }
+        canvas { position: absolute; top: 0; left: 0; transform: scaleX(-1); will-change: transform; }
+        #pointerCanvas { width: 100%; height: 100%; z-index: 6; }
+        #drawCanvas { width: 100%; height: 100%; z-index: 7; background-color: transparent; }
+        #footer { padding: 15px; width: 100%; text-align: center; font-family: 'Caveat', cursive; font-size: 1.5em; position: absolute; bottom: 0; left: 0; z-index: 10; background: linear-gradient(to right, #8A2BE2, #00BFFF, #00FFFF); -webkit-background-clip: text; -webkit-text-fill-color: transparent; pointer-events: none; }
+    </style>
+</head>
+<body>
+
+    <div id="header">
+        <span id="header-main-text"><span class="header-part1">PriAxom AIR</span> <span class="header-part2">by Priyam Kesh</span></span>
+        <div id="header-copyright">Path2D Accelerated Engine</div>
+    </div>
+    
+    <div class="canvas-container">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="pointerCanvas"></canvas>
+        <canvas id="drawCanvas"></canvas>
+    </div>
+
+    <div id="footer">Draw (☝🏻) • Erase (✌🏻) • Select (🖐🏻) • Move (🤏🏻) • Say "Clear"</div>
+
+    <script>
+        const videoElement = document.getElementById('webcam');
+        const pointerCanvas = document.getElementById('pointerCanvas');
+        const pointerCtx = pointerCanvas.getContext('2d', { alpha: false }); // Optimization flag
+        const drawCanvas = document.getElementById('drawCanvas');
+        const drawCtx = drawCanvas.getContext('2d');
+
+        function resizeCanvases() {
+            const container = document.querySelector('.canvas-container');
+            pointerCanvas.width = container.offsetWidth;
+            pointerCanvas.height = container.offsetHeight;
+            drawCanvas.width = container.offsetWidth;
+            drawCanvas.height = container.offsetHeight;
+        }
+        window.addEventListener('resize', resizeCanvases);
+        resizeCanvases(); 
+
+        // ---------------------------------------------------------
+        // Core Mathematical Object Structure: GPU Accelerated Path2D
+        // ---------------------------------------------------------
+        class Stroke {
+            constructor() {
+                this.points = [];
+                this.selected = false;
+                this.bounds = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
+                this.cachedPath = null;
+                this.isDirty = true; // Triggers GPU recompilation only when modified
+            }
+            addPoint(x, y) {
+                this.points.push({x, y});
+                this.bounds.minX = Math.min(this.bounds.minX, x);
+                this.bounds.maxX = Math.max(this.bounds.maxX, x);
+                this.bounds.minY = Math.min(this.bounds.minY, y);
+                this.bounds.maxY = Math.max(this.bounds.maxY, y);
+                this.isDirty = true;
+            }
+            recalculateBounds() {
+                this.bounds = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
+                for (let p of this.points) {
+                    this.bounds.minX = Math.min(this.bounds.minX, p.x);
+                    this.bounds.maxX = Math.max(this.bounds.maxX, p.x);
+                    this.bounds.minY = Math.min(this.bounds.minY, p.y);
+                    this.bounds.maxY = Math.max(this.bounds.maxY, p.y);
+                }
+                this.isDirty = true;
+            }
+            getRenderPath() {
+                if (!this.isDirty && this.cachedPath) return this.cachedPath;
+                
+                let p = new Path2D();
+                if (this.points.length > 0) {
+                    p.moveTo(this.points[0].x, this.points[0].y);
+                    for (let i = 1; i < this.points.length - 1; i++) {
+                        const xc = (this.points[i].x + this.points[i + 1].x) / 2;
+                        const yc = (this.points[i].y + this.points[i + 1].y) / 2;
+                        p.quadraticCurveTo(this.points[i].x, this.points[i].y, xc, yc);
+                    }
+                    if (this.points.length > 1) {
+                        p.lineTo(this.points[this.points.length - 1].x, this.points[this.points.length - 1].y);
+                    }
+                }
+                this.cachedPath = p;
+                this.isDirty = false;
+                return p;
+            }
+        }
+
+        let strokes = []; 
+        let handStates = [
+            { currentStroke: null, grabbedStrokeIndex: -1, lastPinchPos: null, isSelecting: false, selStart: null, selCurrent: null },
+            { currentStroke: null, grabbedStrokeIndex: -1, lastPinchPos: null, isSelecting: false, selStart: null, selCurrent: null }
+        ];
+
+        function onResults(results) {
+            pointerCtx.save();
+            pointerCtx.fillStyle = '#000000';
+            pointerCtx.fillRect(0, 0, pointerCanvas.width, pointerCanvas.height);
+            drawCtx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+
+            if (results.multiHandLandmarks) {
+                for (let i = 0; i < handStates.length; i++) {
+                    const stateObj = handStates[i];
+
+                    if (i >= results.multiHandLandmarks.length) {
+                        stateObj.currentStroke = null;
+                        stateObj.grabbedStrokeIndex = -1;
+                        stateObj.lastPinchPos = null;
+                        if (stateObj.isSelecting) finalizeSelection(stateObj);
+                        continue;
+                    }
+
+                    const landmarks = results.multiHandLandmarks[i];
+                    drawConnectors(pointerCtx, landmarks, HAND_CONNECTIONS, {color: '#00FFFF', lineWidth: 2});
+                    drawLandmarks(pointerCtx, landmarks, {color: '#FFFFFF', lineWidth: 1, radius: 2});
+
+                    const w = drawCanvas.width;
+                    const h = drawCanvas.height;
+                    const thumbX = landmarks[4].x * w, thumbY = landmarks[4].y * h;
+                    const indexX = landmarks[8].x * w, indexY = landmarks[8].y * h;
+                    const middleX = landmarks[12].x * w, middleY = landmarks[12].y * h;
+                    const ringX = landmarks[16].x * w, ringY = landmarks[16].y * h;
+                    const pinkyX = landmarks[20].x * w, pinkyY = landmarks[20].y * h;
+
+                    const isIndexUp = landmarks[8].y < landmarks[6].y;
+                    const isMiddleUp = landmarks[12].y < landmarks[10].y;
+                    const isRingUp = landmarks[16].y < landmarks[14].y;
+                    const isPinkyUp = landmarks[20].y < landmarks[18].y;
+                    
+                    const dThumbTipToPinkyBase = Math.hypot(landmarks[4].x - landmarks[17].x, landmarks[4].y - landmarks[17].y);
+                    const dThumbIpToPinkyBase = Math.hypot(landmarks[3].x - landmarks[17].x, landmarks[3].y - landmarks[17].y);
+                    const isThumbFolded = dThumbTipToPinkyBase < dThumbIpToPinkyBase;
+                    const pinchDist = Math.hypot(thumbX - indexX, thumbY - indexY);
+
+                    // Core State Machine
+                    let state = 'idle';
+                    if (pinchDist < 40) state = 'pinching';
+                    else if (isThumbFolded && isIndexUp && isMiddleUp && isRingUp && isPinkyUp) state = 'selecting';
+                    else if (isIndexUp && isMiddleUp && !isRingUp && !isPinkyUp) state = 'erasing';
+                    else if (isIndexUp && !isMiddleUp && !isRingUp && !isPinkyUp) state = 'drawing';
+
+                    // EXECUTE: DRAWING
+                    if (state === 'drawing') {
+                        pointerCtx.fillStyle = '#1E90FF';
+                        pointerCtx.beginPath(); pointerCtx.arc(indexX, indexY, 10, 0, Math.PI*2); pointerCtx.fill();
+
+                        if (!stateObj.currentStroke) {
+                            stateObj.currentStroke = new Stroke();
+                            stateObj.currentStroke.addPoint(indexX, indexY);
+                            strokes.push(stateObj.currentStroke);
+                        } else {
+                            const lastPt = stateObj.currentStroke.points[stateObj.currentStroke.points.length - 1];
+                            const dist = Math.hypot(indexX - lastPt.x, indexY - lastPt.y);
+                            if (dist > 100) {
+                                stateObj.currentStroke = new Stroke();
+                                stateObj.currentStroke.addPoint(indexX, indexY);
+                                strokes.push(stateObj.currentStroke);
+                            } else if (dist > 4) {
+                                stateObj.currentStroke.addPoint(indexX, indexY);
+                            }
+                        }
+                    } else {
+                        stateObj.currentStroke = null; 
+                    }
+
+                    // EXECUTE: SELECTING
+                    if (state === 'selecting') {
+                        let avgX = (indexX + middleX + ringX + pinkyX) / 4;
+                        let avgY = (indexY + middleY + ringY + pinkyY) / 4;
+                        
+                        if (!stateObj.isSelecting) {
+                            stateObj.isSelecting = true;
+                            stateObj.selStart = { x: avgX, y: avgY };
+                        }
+                        stateObj.selCurrent = { x: avgX, y: avgY };
+
+                        pointerCtx.strokeStyle = '#FFFF00';
+                        pointerCtx.lineWidth = 2;
+                        pointerCtx.setLineDash([10, 10]);
+                        pointerCtx.strokeRect(
+                            stateObj.selStart.x, stateObj.selStart.y, 
+                            stateObj.selCurrent.x - stateObj.selStart.x, stateObj.selCurrent.y - stateObj.selStart.y
+                        );
+                        pointerCtx.setLineDash([]);
+                    } else if (stateObj.isSelecting) {
+                        finalizeSelection(stateObj);
+                    }
+
+                    // EXECUTE: ERASING
+                    if (state === 'erasing') {
+                        const cx = (indexX + middleX) / 2;
+                        const cy = (indexY + middleY) / 2;
+                        const r = 30;
+
+                        pointerCtx.fillStyle = '#FF0044';
+                        pointerCtx.beginPath(); pointerCtx.arc(cx, cy, r, 0, Math.PI*2); pointerCtx.fill();
+
+                        let newStrokes = [];
+                        for (let stroke of strokes) {
+                            if (cx + r < stroke.bounds.minX || cx - r > stroke.bounds.maxX || cy + r < stroke.bounds.minY || cy - r > stroke.bounds.maxY) {
+                                newStrokes.push(stroke);
+                                continue;
+                            }
+                            
+                            let currentNewStroke = new Stroke();
+                            for (let pt of stroke.points) {
+                                if (Math.hypot(pt.x - cx, pt.y - cy) < r) {
+                                    if (currentNewStroke.points.length > 1) newStrokes.push(currentNewStroke);
+                                    currentNewStroke = new Stroke(); 
+                                } else {
+                                    currentNewStroke.addPoint(pt.x, pt.y);
+                                }
+                            }
+                            if (currentNewStroke.points.length > 1) newStrokes.push(currentNewStroke);
+                        }
+                        strokes = newStrokes;
+                    }
+
+                    // EXECUTE: PINCHING
+                    if (state === 'pinching') {
+                        const px = (thumbX + indexX) / 2;
+                        const py = (thumbY + indexY) / 2;
+
+                        pointerCtx.strokeStyle = '#00FF00'; pointerCtx.lineWidth = 3;
+                        pointerCtx.beginPath(); pointerCtx.moveTo(thumbX, thumbY); pointerCtx.lineTo(indexX, indexY); pointerCtx.stroke();
+                        pointerCtx.fillStyle = '#00FF00';
+                        pointerCtx.beginPath(); pointerCtx.arc(px, py, 8, 0, Math.PI*2); pointerCtx.fill();
+
+                        let hasSelection = strokes.some(s => s.selected);
+
+                        if (hasSelection) {
+                            if (stateObj.lastPinchPos) {
+                                let dx = px - stateObj.lastPinchPos.x;
+                                let dy = py - stateObj.lastPinchPos.y;
+                                strokes.forEach(s => {
+                                    if (s.selected) {
+                                        s.points.forEach(pt => { pt.x += dx; pt.y += dy; });
+                                        s.recalculateBounds();
+                                    }
+                                });
+                            }
+                        } else {
+                            if (stateObj.grabbedStrokeIndex === -1) {
+                                let closestDist = Infinity;
+                                let closestIdx = -1;
+                                for (let j = 0; j < strokes.length; j++) {
+                                    let b = strokes[j].bounds;
+                                    if (px < b.minX - 60 || px > b.maxX + 60 || py < b.minY - 60 || py > b.maxY + 60) continue;
+
+                                    for (let pt of strokes[j].points) {
+                                        let d = Math.hypot(pt.x - px, pt.y - py);
+                                        if (d < 60 && d < closestDist) {
+                                            closestDist = d;
+                                            closestIdx = j;
+                                        }
+                                    }
+                                }
+                                if (closestIdx !== -1) {
+                                    stateObj.grabbedStrokeIndex = closestIdx;
+                                }
+                            } else {
+                                if (stateObj.lastPinchPos && strokes[stateObj.grabbedStrokeIndex]) {
+                                    let dx = px - stateObj.lastPinchPos.x;
+                                    let dy = py - stateObj.lastPinchPos.y;
+                                    strokes[stateObj.grabbedStrokeIndex].points.forEach(pt => { pt.x += dx; pt.y += dy; });
+                                    strokes[stateObj.grabbedStrokeIndex].recalculateBounds();
+                                }
+                            }
+                        }
+                        stateObj.lastPinchPos = { x: px, y: py };
+                    } else {
+                        stateObj.grabbedStrokeIndex = -1;
+                        stateObj.lastPinchPos = null;
+                    }
+                }
+            }
+            pointerCtx.restore();
+
+            // ---------------------------------------------------------
+            // Output Rendering: GPU Hardware Accelerated Execution
+            // ---------------------------------------------------------
+            drawCtx.lineCap = 'round';
+            drawCtx.lineJoin = 'round';
+
+            for (let stroke of strokes) {
+                if (stroke.points.length < 2) continue;
+                
+                if (stroke.selected) {
+                    drawCtx.strokeStyle = '#FFFF00'; 
+                    drawCtx.shadowColor = '#FFD700';
+                    drawCtx.lineWidth = 6;
+                    drawCtx.shadowBlur = 20;
+                } else {
+                    drawCtx.strokeStyle = '#00FFFF'; 
+                    drawCtx.shadowColor = '#1E90FF';
+                    drawCtx.lineWidth = 4;           
+                    drawCtx.shadowBlur = 12;
+                }
+
+                // Execute the pre-compiled C++ Path2D via GPU
+                drawCtx.stroke(stroke.getRenderPath());
+            }
+        }
+
+        function finalizeSelection(stateObj) {
+            stateObj.isSelecting = false;
+            let minX = Math.min(stateObj.selStart.x, stateObj.selCurrent.x);
+            let maxX = Math.max(stateObj.selStart.x, stateObj.selCurrent.x);
+            let minY = Math.min(stateObj.selStart.y, stateObj.selCurrent.y);
+            let maxY = Math.max(stateObj.selStart.y, stateObj.selCurrent.y);
+            
+            strokes.forEach(s => {
+                if (!(s.bounds.maxX < minX || s.bounds.minX > maxX || s.bounds.maxY < minY || s.bounds.minY > maxY)) {
+                    s.selected = s.points.some(p => p.x >= minX && p.x <= maxX && p.y >= minY && p.y <= maxY);
+                } else {
+                    s.selected = false;
+                }
+            });
+        }
+
+        // Reduced modelComplexity to 0 for maximum FPS frame processing
+        const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+        hands.setOptions({ maxNumHands: 2, modelComplexity: 0, minDetectionConfidence: 0.7, minTrackingConfidence: 0.7 });
+        hands.onResults(onResults);
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({image: videoElement}); },
+            width: 640, height: 480
+        });
+        camera.start();
+
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (SpeechRecognition) {
+            const recognition = new SpeechRecognition();
+            recognition.continuous = true; 
+            recognition.interimResults = false;
+            recognition.lang = 'en-US';
+
+            recognition.onresult = (event) => {
+                const transcript = event.results[event.results.length - 1][0].transcript.trim().toLowerCase();
+                if (transcript.includes('clear')) strokes = []; 
+            };
+            recognition.onend = () => { try { recognition.start(); } catch(e) {} };
+            recognition.start();
+        }
+    </script>
+</body>
+</html>
